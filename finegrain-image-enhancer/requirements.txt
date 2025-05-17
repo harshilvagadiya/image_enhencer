@@ -1,0 +1,6 @@
+spaces>=0.35.0
+git+https://github.com/finegrain-ai/refiners@cfe8b66ba4f8a906583850ac25e9e89cb83a44b9
+gradio_imageslider==0.0.20
+numpy<2.0.0
+pillow>=10.4.0
+pillow-heif>=0.18.0

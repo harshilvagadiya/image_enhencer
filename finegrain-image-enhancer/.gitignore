@@ -1,0 +1,5 @@
+.gradio/
+requirements-dev.lock
+
+__pycache__/
+*.py[cod]
