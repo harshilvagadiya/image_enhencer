@@ -1,22 +1,28 @@
 import io
+import logging
 from pathlib import Path
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import StreamingResponse
 from PIL import Image
 import torch
-import asyncio
-from concurrent.futures import ThreadPoolExecutor
-
-from huggingface_hub import hf_hub_download
 import pillow_heif
-import pillow_avif  # just import, no register call
-
 from src.enhancer import ESRGANUpscaler, ESRGANUpscalerCheckpoints
+from huggingface_hub import hf_hub_download
 from refiners.foundationals.latent_diffusion import Solver, solvers
 
 pillow_heif.register_heif_opener()
+pillow_heif.register_avif_opener()
 
-# Download and setup checkpoints (only happens once on startup)
+app = FastAPI(title="Finegrain Image Enhancer API")
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger("enhancer_api")
+
+# Load checkpoints once
 CHECKPOINTS = ESRGANUpscalerCheckpoints(
     unet=Path(
         hf_hub_download(
@@ -79,47 +85,42 @@ CHECKPOINTS = ESRGANUpscalerCheckpoints(
     },
 )
 
-# Setup device & dtype
-DEVICE_CPU = torch.device("cpu")
-DTYPE = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
-enhancer = ESRGANUpscaler(checkpoints=CHECKPOINTS, device=DEVICE_CPU, dtype=DTYPE)
-
+# Setup device and dtype
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DTYPE = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
+
+# Initialize enhancer
+enhancer = ESRGANUpscaler(checkpoints=CHECKPOINTS, device=DEVICE, dtype=DTYPE)
 enhancer.to(device=DEVICE, dtype=DTYPE)
 
-app = FastAPI()
+def enhance_image(
+    image: Image.Image,
+    prompt: str = "masterpiece, best quality, highres",
+    negative_prompt: str = "worst quality, low quality, normal quality",
+    seed: int = 42,
+    upscale_factor: int = 2,
+    controlnet_scale: float = 0.6,
+    controlnet_decay: float = 1.0,
+    condition_scale: int = 6,
+    tile_width: int = 112,
+    tile_height: int = 144,
+    denoise_strength: float = 0.35,
+    num_inference_steps: int = 18,
+    solver: str = "DDIM",
+) -> Image.Image:
+    solver_type: type[Solver] = getattr(solvers, solver)
 
-# ThreadPoolExecutor for running CPU/GPU-heavy processing without blocking
-executor = ThreadPoolExecutor(max_workers=1)  # adjust max_workers if you want concurrency
-
-def process_api(input_image: Image.Image) -> Image.Image:
-    prompt = "masterpiece, best quality, highres"
-    negative_prompt = "worst quality, low quality, normal quality"
-    seed = 42
-    upscale_factor = 2
-    controlnet_scale = 0.6
-    controlnet_decay = 1.0
-    condition_scale = 6
-    tile_width = 112
-    tile_height = 144
-    denoise_strength = 0.35
-    num_inference_steps = 18
-    solver = "DDIM"
-
-    solver_type = getattr(solvers, solver)
     generator = torch.Generator(device=DEVICE)
     generator.manual_seed(seed)
 
-    side_size = min(input_image.size)
+    side_size = min(image.size)
     if side_size > 768:
         scale = 768 / side_size
-        new_size = (int(input_image.width * scale), int(input_image.height * scale))
-        resized_image = input_image.resize(new_size, resample=Image.Resampling.LANCZOS)
-    else:
-        resized_image = input_image
+        new_size = (int(image.width * scale), int(image.height * scale))
+        image = image.resize(new_size, resample=Image.Resampling.LANCZOS)
 
-    enhanced_image = enhancer.upscale(
-        image=resized_image,
+    enhanced = enhancer.upscale(
+        image=image,
         prompt=prompt,
         negative_prompt=negative_prompt,
         upscale_factor=upscale_factor,
@@ -133,19 +134,53 @@ def process_api(input_image: Image.Image) -> Image.Image:
         solver_type=solver_type,
         generator=generator,
     )
-    return enhanced_image
+    return enhanced
 
 @app.post("/enhance/")
-async def enhance_image(file: UploadFile = File(...)):
-    image_bytes = await file.read()
-    input_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+async def enhance(
+    file: UploadFile = File(...),
+    prompt: str = Form("masterpiece, best quality, highres"),
+    negative_prompt: str = Form("worst quality, low quality, normal quality"),
+    seed: int = Form(42),
+    upscale_factor: int = Form(2),
+    controlnet_scale: float = Form(0.6),
+    controlnet_decay: float = Form(1.0),
+    condition_scale: int = Form(6),
+    tile_width: int = Form(112),
+    tile_height: int = Form(144),
+    denoise_strength: float = Form(0.35),
+    num_inference_steps: int = Form(18),
+    solver: str = Form("DDIM"),
+):
+    try:
+        contents = await file.read()
+        image = Image.open(io.BytesIO(contents)).convert("RGB")
 
-    # Run the heavy process_api in a thread to avoid blocking event loop
-    loop = asyncio.get_event_loop()
-    enhanced_image = await loop.run_in_executor(executor, process_api, input_image)
+        logger.info(f"Received image {file.filename} of size {image.size}")
 
-    buf = io.BytesIO()
-    enhanced_image.save(buf, format="PNG")
-    buf.seek(0)
+        enhanced_image = enhance_image(
+            image=image,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            seed=seed,
+            upscale_factor=upscale_factor,
+            controlnet_scale=controlnet_scale,
+            controlnet_decay=controlnet_decay,
+            condition_scale=condition_scale,
+            tile_width=tile_width,
+            tile_height=tile_height,
+            denoise_strength=denoise_strength,
+            num_inference_steps=num_inference_steps,
+            solver=solver,
+        )
 
-    return StreamingResponse(buf, media_type="image/png")
+        buf = io.BytesIO()
+        enhanced_image.save(buf, format="PNG")
+        buf.seek(0)
+
+        logger.info("Image enhancement successful")
+        return StreamingResponse(buf, media_type="image/png")
+
+    except Exception as e:
+        logger.error(f"Error processing image: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Image enhancement failed: {e}")
